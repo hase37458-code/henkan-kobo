@@ -1191,67 +1191,37 @@
     return ensureLib(() => typeof fontkit !== 'undefined', 'https://unpkg.com/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js');
   }
 
-  // pdf-lib(+fontkit)はWOFF2形式のフォントを正しく埋め込めず、PDFが白紙になる
-  // 既知の問題があるため(元のWOFF2バイト列をそのままTrueTypeとして書き出してしまう)、
-  // 埋め込み前にTrueType形式へ変換する。変換にはWOFF2デコーダ(wawoff2)を使用する。
-  let wawoff2Ready = null;
-  async function ensureWawoff2(){
-    if (typeof Module !== 'undefined' && typeof Module.decompress === 'function') return;
-    if (wawoff2Ready) return wawoff2Ready;
-    wawoff2Ready = new Promise((resolve, reject) => {
-      window.Module = { onRuntimeInitialized: resolve };
-      loadScript('https://unpkg.com/wawoff2@2.0.1/build/decompress_binding.js').catch(reject);
-    }).catch(err => {
-      wawoff2Ready = null;
-      throw err;
-    });
-    return wawoff2Ready;
-  }
+  // 日本語DOCX→PDF用のフォント。文書の内容（文字集合など）とは無関係な固定URLから取得する。
+  // IPAフォントライセンスv1.0で配布されている「IPAゴシック」(TrueType, Regular, 可変フォントではない)。
+  // 実機のChrome DevToolsで実際にfetch()し、SHA-256ハッシュ値がローカルで解析した実体と
+  // 完全一致することを確認済みのURL。
+  const JAPANESE_FONT_URL = 'https://cdn.jsdelivr.net/gh/k1LoW/pdf/tests/ipag00303/ipag.ttf';
+  const JAPANESE_FONT_SHA256 = '503af4a8b84d1079b8e2e358dc7f7a7fb8cb7a1f212f35eaef6782dbfc75a55e';
 
-  // 文書の内容（文字集合など）は一切含めない、固定・汎用のフォント取得リクエストです。
-  // どのユーザー・どの文書でも常に同じURLをリクエストするため、ファイル内容が外部へ伝わることはありません。
   let cachedJapaneseFontBytes = null;
   async function fetchJapaneseFontBytes(){
     if (cachedJapaneseFontBytes) return cachedJapaneseFontBytes;
-    const cssUrl = 'https://fonts.googleapis.com/css2?family=Noto+Sans+JP&display=swap';
-    const cssRes = await fetch(cssUrl);
-    if (!cssRes.ok) throw new Error('日本語フォントの取得に失敗しました（CSSの取得エラー: ' + cssRes.status + '）');
-    const css = await cssRes.text();
-    // レスポンスの形式はGoogle側の判定により変わる。
-    // ・unicode-rangeで分割された複数ブロック（形式はwoff2とは限らない）の場合と、
-    // ・分割されず単一ブロックで完結する場合（unicode-rangeが存在しない）の両方があり得るため、
-    // 拡張子や文字列長では判定せず、実際のUnicodeコードポイントで日本語を含むかを判定する。
-    const blocks = css.split('@font-face').slice(1);
-    const candidates = blocks.map(block => {
-      const urlMatch = block.match(/url\((https:[^)]+)\)/);
-      const rangeMatch = block.match(/unicode-range:\s*([^;]+);/);
-      return { url: urlMatch ? urlMatch[1] : null, range: rangeMatch ? rangeMatch[1] : null };
-    }).filter(c => c.url);
-    if (!candidates.length) throw new Error('日本語フォントの取得に失敗しました（フォントURLが見つかりません）');
 
-    // ひらがな・カタカナ(U+3040-30FF)またはCJK統合漢字(U+4E00-9FFF)を含むかどうかを判定
-    function coversJapanese(range){
-      if (!range) return false;
-      const hexes = range.match(/[0-9A-Fa-f]+/g) || [];
-      return hexes.some(hex => {
-        const n = parseInt(hex, 16);
-        return (n >= 0x3040 && n <= 0x30FF) || (n >= 0x4E00 && n <= 0x9FFF);
-      });
+    const res = await fetch(JAPANESE_FONT_URL);
+    if (!res.ok) throw new Error('日本語フォントの取得に失敗しました（HTTPエラー: ' + res.status + '）');
+
+    const buf = await res.arrayBuffer();
+    if (!buf || buf.byteLength === 0) throw new Error('日本語フォントの取得に失敗しました（データが空です）');
+
+    const bytes = new Uint8Array(buf);
+    // TrueTypeの先頭マジックバイト(00 01 00 00)を確認する。
+    if (!(bytes[0] === 0x00 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00)){
+      throw new Error('日本語フォントの取得に失敗しました（TrueType形式のデータではありません）');
     }
 
-    // 優先順: 日本語を含むと判定できたブロック → unicode-range指定がない(=フォント全体が1ファイル)ブロック → 先頭のブロック
-    const chosen = candidates.find(c => coversJapanese(c.range))
-      || candidates.find(c => !c.range)
-      || candidates[0];
+    // 配信元が差し替えられていないか、取得内容のSHA-256をあらかじめ検証済みの値と照合する。
+    const digest = await crypto.subtle.digest('SHA-256', buf);
+    const hashHex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    if (hashHex !== JAPANESE_FONT_SHA256){
+      throw new Error('日本語フォントの取得に失敗しました（データの検証に失敗しました。配信元が変更された可能性があります）');
+    }
 
-    const fontRes = await fetch(chosen.url);
-    if (!fontRes.ok) throw new Error('日本語フォントの取得に失敗しました（フォント本体の取得エラー: ' + fontRes.status + '）');
-    const woff2Bytes = new Uint8Array(await fontRes.arrayBuffer());
-
-    // WOFF2のままpdf-libへ渡すと白紙PDFになる既知の問題があるため、TrueTypeへ変換する。
-    await ensureWawoff2();
-    const decompressed = Module.decompress(woff2Bytes);
-    cachedJapaneseFontBytes = decompressed instanceof Uint8Array ? decompressed : new Uint8Array(decompressed);
+    cachedJapaneseFontBytes = bytes;
     return cachedJapaneseFontBytes;
   }
 
@@ -1262,6 +1232,22 @@
     const pdfDoc = await PDFDocument.create();
     pdfDoc.registerFontkit(fontkit);
     const fontBytes = await fetchJapaneseFontBytes();
+
+    // 本文の文字が、このフォントに実際に収録されているかを埋め込み前に確認する。
+    // 収録されていない文字がある場合、豆腐文字のPDFを「成功」として返さず、ここでエラーにする。
+    const parsedFont = fontkit.create(fontBytes);
+    const supportedCodePoints = new Set(parsedFont.characterSet);
+    const missingChars = new Set();
+    for (const ch of text){
+      const code = ch.codePointAt(0);
+      if (code < 0x20) continue; // 改行・タブ等の制御文字は描画対象外のため除外
+      if (!supportedCodePoints.has(code)) missingChars.add(ch);
+    }
+    if (missingChars.size){
+      const sample = Array.from(missingChars).slice(0, 10).join(' ');
+      throw new Error('日本語フォントに対応していない文字が含まれています（例: ' + sample + '）');
+    }
+
     // 注意: pdf-libの subset:true オプションは、日本語のような文字数の多い
     // CJKフォントを埋め込む際にサブセット処理が壊れ、PDFが白紙になる既知の問題がある。
     // そのためここでは意図的にsubsetを使わず、フォント全体を埋め込む。
